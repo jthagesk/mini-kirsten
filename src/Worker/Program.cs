@@ -7,7 +7,7 @@ using Worker;
 //
 // Environment variables: see ../../.env.example
 
-const string DefaultAnthropicWorkspaceId = "wrkspc_014PnTrso2hTWspRTHbJp62c";
+const string DefaultAnthropicWorkspaceId = "wrkspc_017LSdCTfnAddrQcuKrM38Aq";
 const string AnthropicWorkspaceHeader = "anthropic-workspace-id";
 
 try

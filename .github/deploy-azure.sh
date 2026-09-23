@@ -32,7 +32,7 @@ AGENT_MENTION="${AGENT_MENTION:-}"
 TARGET_REPO="${TARGET_REPO:-novanet/workshop.oslo-live}"
 # The course key is shared across participants; keep older .env files working
 # even when they were copied before this setting was added to .env.example.
-ANTHROPIC_WORKSPACE_ID="${ANTHROPIC_WORKSPACE_ID:-wrkspc_014PnTrso2hTWspRTHbJp62c}"
+ANTHROPIC_WORKSPACE_ID="${ANTHROPIC_WORKSPACE_ID:-wrkspc_017LSdCTfnAddrQcuKrM38Aq}"
 
 # Your agent identity is the only participant-specific deployment input. It
 # appears in commits, PRs, the status page, and the namespaced ACR images.
