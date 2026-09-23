@@ -53,9 +53,11 @@
     {
       "name": "self-review",
       "prompt": "self-review.md",
-      "model": "claude-sonnet-5",
+      // Lab 3: cheaper review. Haiku instead of Sonnet, and no Glob, so the
+      // review stays on the diff instead of rediscovering the repository.
+      "model": "claude-haiku-4-5",
       "allowedTools": [
-        "Read", "Glob", "Grep", "Edit",
+        "Read", "Grep", "Edit",
         "Bash(git diff:*)", "Bash(git status:*)",
         "Bash(dotnet build:*)", "Bash(dotnet test:*)"
       ],
