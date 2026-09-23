@@ -174,7 +174,7 @@ på agentrepoet eller på `main`.
 
 ### 3. Bygg konteksten
 
-- installer skills med `InstallSkills()`,
+- installer skills i det klonede repoet med `InstallSkills(repo.Path)`,
 - les agentens hukommelse med `ReadMemory()`,
 - bygg systemprompten med `BuildSystemPrompt(memory)`,
 - start `previousOutput` som en tom streng.
