@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Receiver/Receiver.csproj" />
+    <Project Path="src/Worker/Worker.csproj" />
+  </Folder>
+</Solution>

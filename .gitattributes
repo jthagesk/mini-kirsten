@@ -1,0 +1,5 @@
+# Skript og containerfiler maa ha LF, ellers feiler de paa Linux og i containeren.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.bicep text eol=lf

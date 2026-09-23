@@ -1,0 +1,6 @@
+.env
+.deploy-outputs.json
+.git
+**/bin
+**/obj
+agent/memory.md

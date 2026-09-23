@@ -1,0 +1,66 @@
+{
+  // The model all stages use unless they override it with "model".
+  // In Azure, CLAUDE_MODEL replaces this value, but not a stage's own "model".
+  "model": "claude-sonnet-5",
+
+  // Run in the repository after the last stage. If one fails, the PR becomes a draft
+  // (or no PR at all when stopOnVerifyFailure is true).
+  "verify": [
+    "dotnet build --nologo -v quiet",
+    "dotnet test --nologo -v quiet"
+  ],
+
+  // false: a red build still gives a PR, marked as a draft.
+  // true: a red build gives no PR, only an issue comment with the build log.
+  // Lab 3, quality-gates track: try true.
+  "stopOnVerifyFailure": false,
+
+  // Stages run in order. Each stage receives the previous stage's response as {PreviousOutput}.
+  // Without Edit/Write, the tool profile is read-only. Build, test, commit, push
+  // and PR creation happen in deterministic worker code after these model stages.
+  "stages": [
+    {
+      "name": "research",
+      "prompt": "research.md",
+      "model": "claude-opus-5-5",
+      "allowedTools": [
+        "Read", "Glob", "Grep",
+        "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)"
+      ],
+      "maxTurns": 25,
+      "timeoutMinutes": 8
+    },
+    {
+      "name": "plan-review",
+      "prompt": "plan-review.md",
+      "model": "claude-haiku-4-5",
+      "allowedTools": ["Read", "Glob", "Grep"],
+      "maxTurns": 15,
+      "timeoutMinutes": 6
+    },
+    {
+      "name": "implement",
+      "prompt": "implement-from-plan.md",
+      "model": "claude-sonnet-5",
+      "allowedTools": [
+        "Read", "Glob", "Grep", "Edit", "Write",
+        "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(git diff:*)", "Bash(git status:*)",
+        "mcp__allemannsdata"
+      ],
+      "maxTurns": 60,
+      "timeoutMinutes": 15
+    },
+    {
+      "name": "self-review",
+      "prompt": "self-review.md",
+      "model": "claude-sonnet-5",
+      "allowedTools": [
+        "Read", "Glob", "Grep", "Edit",
+        "Bash(git diff:*)", "Bash(git status:*)",
+        "Bash(dotnet build:*)", "Bash(dotnet test:*)"
+      ],
+      "maxTurns": 30,
+      "timeoutMinutes": 10
+    }
+  ]
+}
