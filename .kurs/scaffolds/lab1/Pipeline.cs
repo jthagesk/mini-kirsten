@@ -207,10 +207,12 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
         }
     }
 
-    private void InstallSkills()
+    private void InstallSkills(string repoPath)
     {
-        // Skills in agent/skills/ are copied to the user's Claude directory so
-        // the harness can find them without putting them in the working repository.
+        // Skills in agent/skills/ are copied into the cloned repository's
+        // .claude/skills/, where Claude Code finds them as project skills. The
+        // folder is added to .git/info/exclude so the copies never show up as a
+        // change, in HasChanges or in the commit.
         var source = Path.Combine(agentDir, "skills");
         if (!Directory.Exists(source))
         {
@@ -218,23 +220,36 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             return;
         }
 
-        var home = Environment.GetEnvironmentVariable("HOME")
-            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var target = Path.Combine(home, ".claude", "skills");
+        var target = Path.Combine(repoPath, ".claude", "skills");
+        var exclude = Path.Combine(repoPath, ".git", "info", "exclude");
+        Directory.CreateDirectory(Path.GetDirectoryName(exclude)!);
+        var excluded = File.Exists(exclude) ? File.ReadAllLines(exclude) : [];
 
         foreach (var dir in Directory.GetDirectories(source))
         {
             var name = Path.GetFileName(dir);
             var dest = Path.Combine(target, name);
-            Directory.CreateDirectory(dest);
+            var pattern = $"/.claude/skills/{name}/";
+            var ours = excluded.Contains(pattern);
+            if (Directory.Exists(dest) && !ours)
+            {
+                // The repository has its own skill with this name. Do not overwrite it.
+                Log.Info($"Skill «{name}» finnes allerede i repoet. Beholder repoets versjon.");
+                continue;
+            }
+
             foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
             {
-                var relative = Path.GetRelativePath(dir, file);
-                var destFile = Path.Combine(dest, relative);
+                var destFile = Path.Combine(dest, Path.GetRelativePath(dir, file));
                 Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
                 File.Copy(file, destFile, overwrite: true);
             }
-            Log.Info($"Skill «{name}» installert");
+
+            if (!ours)
+            {
+                File.AppendAllLines(exclude, [pattern]);
+            }
+            Log.Info($"Skill «{name}» installert i {dest}");
         }
     }
 

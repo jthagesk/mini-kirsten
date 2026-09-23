@@ -16,13 +16,10 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
     private static string AgentName => Environment.GetEnvironmentVariable("AGENT_NAME") ?? "Mini-Nils";
 
     // ASSEMBLY_START
-    /// <summary>
-    /// This is the Lab 1 scaffold. Implement RunStages from the recipe in
-    /// docs/lab1.md. The complete implementation is kept as a checkpoint.
-    /// </summary>
+    /// <param name="skipReservation">Skip the open-issue check. Multiple agents may work on the same issue.</param>
+    /// <param name="dryRun">Check the issue status, then stop before changing the repository or spending model tokens.</param>
     public async Task<int> Run(AgentTask task, bool skipReservation = false, bool dryRun = false)
     {
-        // PR mentions get a short answer, not the full pipeline.
         if (task.Interaction is not null)
         {
             return await RunMention(task);
@@ -30,45 +27,7 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
 
         Log.Step($"Oppgave: {task.Repo}#{task.IssueNumber} «{task.Title}»");
 
-        if (dryRun)
-        {
-            if (skipReservation)
-            {
-                Log.Info("--dry-run: hopper over issue-statussjekken etter --skip-reservation.");
-            }
-            else
-            {
-                var reason = await Reservation.IsBusy(task, AgentName);
-                Log.Info(reason is null
-                    ? "--dry-run: issuen er åpen. Hopper over reservasjon og repoendringer."
-                    : $"--dry-run: issuen ville blitt liggende: {reason}.");
-            }
-
-            return 0;
-        }
-
-        var runs = new List<StageRun>();
-        try
-        {
-            return await RunStages(task, skipReservation, runs);
-        }
-        catch (Exception ex)
-        {
-            await Comment(
-                task,
-                $"Agenten krasjet: {ex.Message}\n\n" +
-                $"{UsageTable(runs)}\n" +
-                $"{EndMarker(task, "krasj", pr: false, runs)}");
-            throw;
-        }
-    }
-
-    private async Task<int> RunStages(
-        AgentTask task,
-        bool skipReservation,
-        List<StageRun> runs)
-    {
-        // 1. Check issue status before spending any tokens.
+        // Do not spend tokens on an issue that has already been closed.
         if (skipReservation)
         {
             Log.Info("--skip-reservation: hopper over issue-statussjekken.");
@@ -80,39 +39,78 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             if (reason is not null)
             {
                 Log.Info($"Lar issuen ligge: {reason}.");
-                await Comment(task, $"**{AgentName}** lar denne ligge: {reason}.");
+                if (dryRun)
+                {
+                    Log.Info("--dry-run: skriver ingen kommentar.");
+                }
+                else
+                {
+                    Log.Info("Skriver forklaring som kommentar og avslutter.");
+                    await Comment(task, $"**{AgentName}** lar denne ligge: {reason}.");
+                }
                 return 0;
             }
-            // A visible assignment, not an exclusive lock.
+            if (dryRun)
+            {
+                Log.Info("--dry-run: issuen er åpen. Hopper over resten og avslutter.");
+                return 0;
+            }
             await Reservation.Claim(task);
             Log.Info("Issue-statussjekk ferdig. Fortsetter.");
         }
 
-        // 2. Clean workspace on a fresh branch. The model never works on main.
+        if (dryRun)
+        {
+            Log.Info("--dry-run: kontrollen er ferdig. Avslutter før clone, issue-kommentar, Claude Code og PR.");
+            return 0;
+        }
+
         Log.Info($"Kloner {task.Repo} til {workspace} ...");
         var repo = await Repository.Clone(task.Repo, workspace);
         Log.Info($"Repo klart: {repo.Path}");
+        Log.Info($"Lager branch {task.BranchName} ...");
         await repo.CreateBranch(task.BranchName);
         Log.Info($"Branch {task.BranchName} i {repo.Path}");
 
-        // The result board reads this marker and displays who is working on what.
+        // Announce that work has started. The result board reads this marker and
+        // displays who is working on what.
+        Log.Info("Skriver startmarkør på issuen.");
         await Comment(repo, task, $"**{AgentName}** starter på denne nå.\n\n{StartMarker(task)}");
 
-        // 3. Build the context.
+        var runs = new List<StageRun>();
+        try
+        {
+            Log.Info("Starter modellstegene.");
+            return await RunStages(task, repo, runs);
+        }
+        catch (Exception ex)
+        {
+            // A failed run still costs money, so report it to the result board.
+            await Comment(repo, task,
+                $"Agenten krasjet: {ex.Message}\n\n{UsageTable(runs)}\n{EndMarker(task, "krasj", pr: false, runs)}");
+            throw;
+        }
+    }
+
+    private async Task<int> RunStages(AgentTask task, Repository repo, List<StageRun> runs)
+    {
         Log.Info("Installerer skills.");
-        InstallSkills();
+        InstallSkills(repo.Path);
         var memory = await ReadMemory();
+        Log.Info("Bygger systemprompt.");
         var systemPrompt = BuildSystemPrompt(memory);
         Log.Info($"Systemprompt klar ({systemPrompt.Length} tegn).");
+
         var previousOutput = "";
 
-        // 4. Run the configured model stages. The config decides the order, not the model.
         foreach (var stage in config.Stages)
         {
             var model = string.IsNullOrWhiteSpace(stage.Model) ? config.Model : stage.Model;
             Log.Step($"Stage «{stage.Name}» ({model}, {(stage.CanWrite ? "skriv" : "les")}-profil, maks {stage.MaxTurns} turer)");
 
+            Log.Info($"Bygger prompt for stage «{stage.Name}».");
             var prompt = BuildPrompt(stage, task, previousOutput);
+            Log.Info($"Starter Claude Code for «{stage.Name}» ({prompt.Length} tegn prompt).");
             var result = await ClaudeRunner.Run(stage, model, prompt, systemPrompt, repo.Path);
             runs.Add(new StageRun(stage.Name, model, result));
             LogUsage(stage.Name, model, result);
@@ -125,7 +123,6 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
                 return 1;
             }
 
-            // 4b. Implement never starts on a plan that was not approved.
             if (stage.Name.Equals("plan-review", StringComparison.OrdinalIgnoreCase) &&
                 !result.Text.TrimStart().StartsWith("PLAN GODKJENT", StringComparison.OrdinalIgnoreCase))
             {
@@ -139,8 +136,10 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             previousOutput = result.Text;
         }
 
-        // 5. A good explanation without a diff is not a delivery.
-        if (!await repo.HasChanges())
+        Log.Info("Sjekker om agenten gjorde endringer.");
+        var hasChanges = await repo.HasChanges();
+        Log.Info(hasChanges ? "Endringer funnet." : "Ingen endringer funnet.");
+        if (!hasChanges)
         {
             Log.Info("Ingen endringer i repoet. Poster agentens svar som kommentar.");
             await Comment(repo, task,
@@ -149,8 +148,8 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             return 0;
         }
 
-        // 6. Build and test in code. The model saying it works is not a gate.
         Log.Step("Build & deliver (deterministisk kode)");
+        Log.Info("Sjekker bygg og tester utenfor modellen.");
         var (verified, verifyLog) = await Verify(repo.Path);
 
         if (!verified && config.StopOnVerifyFailure)
@@ -162,14 +161,16 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             return 2;
         }
 
-        // 7. Deliver as a pull request. No auto-merge: a person reviews and merges.
         Log.Step("Leverer");
+        Log.Info("Committer og pusher branch.");
         await repo.CommitAndPush(task.BranchName, $"{task.Title}\n\nLøser #{task.IssueNumber}.");
+        Log.Info("Branch pushet. Oppretter eller oppdaterer pull request.");
         var prUrl = await repo.CreatePullRequest(
             task.BranchName,
             task.Title,
             PrBody(task, previousOutput, verified, verifyLog, runs),
             draft: !verified);
+        // No auto-merge: the PR goes to human review, and a person merges it.
         Log.Info($"PR: {prUrl}");
 
         await Comment(repo, task,
@@ -303,10 +304,12 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
         }
     }
 
-    private void InstallSkills()
+    private void InstallSkills(string repoPath)
     {
-        // Skills in agent/skills/ are copied to the user's Claude directory so
-        // the harness can find them without putting them in the working repository.
+        // Skills in agent/skills/ are copied into the cloned repository's
+        // .claude/skills/, where Claude Code finds them as project skills. The
+        // folder is added to .git/info/exclude so the copies never show up as a
+        // change, in HasChanges or in the commit.
         var source = Path.Combine(agentDir, "skills");
         if (!Directory.Exists(source))
         {
@@ -314,23 +317,36 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
             return;
         }
 
-        var home = Environment.GetEnvironmentVariable("HOME")
-            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var target = Path.Combine(home, ".claude", "skills");
+        var target = Path.Combine(repoPath, ".claude", "skills");
+        var exclude = Path.Combine(repoPath, ".git", "info", "exclude");
+        Directory.CreateDirectory(Path.GetDirectoryName(exclude)!);
+        var excluded = File.Exists(exclude) ? File.ReadAllLines(exclude) : [];
 
         foreach (var dir in Directory.GetDirectories(source))
         {
             var name = Path.GetFileName(dir);
             var dest = Path.Combine(target, name);
-            Directory.CreateDirectory(dest);
+            var pattern = $"/.claude/skills/{name}/";
+            var ours = excluded.Contains(pattern);
+            if (Directory.Exists(dest) && !ours)
+            {
+                // The repository has its own skill with this name. Do not overwrite it.
+                Log.Info($"Skill «{name}» finnes allerede i repoet. Beholder repoets versjon.");
+                continue;
+            }
+
             foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
             {
-                var relative = Path.GetRelativePath(dir, file);
-                var destFile = Path.Combine(dest, relative);
+                var destFile = Path.Combine(dest, Path.GetRelativePath(dir, file));
                 Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
                 File.Copy(file, destFile, overwrite: true);
             }
-            Log.Info($"Skill «{name}» installert");
+
+            if (!ours)
+            {
+                File.AppendAllLines(exclude, [pattern]);
+            }
+            Log.Info($"Skill «{name}» installert i {dest}");
         }
     }
 
