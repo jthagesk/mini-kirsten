@@ -68,20 +68,116 @@ internal sealed class Pipeline(AgentConfig config, string agentDir, string works
         bool skipReservation,
         List<StageRun> runs)
     {
-        // TODO 0: Remove this placeholder (the Log.Error line and "return 2" at the bottom).
-        Log.Error("Lab 1-skallet er ikke implementert ennå. Følg docs/lab1.md og implementer RunStages før du kjører agenten.");
-        // Each TODO matches a step in docs/lab1.md, "Slik gjør du det i RunStages".
-        // TODO 1: Reserve the task unless skipReservation is set. (lab1.md, step 1)
-        // TODO 2: Clone the repository and create a branch. (step 2)
-        // TODO 3: Build the system prompt and context. (step 3)
-        // TODO 4: Run the configured model stages. (step 4)
-        // TODO 4b: Stop unless plan-review starts with PLAN GODKJENT. (step 4b)
-        // TODO 5: Stop when the agent did not create a diff. (step 5)
-        // TODO 6: Run build and test as a deterministic gate. (step 6)
-        // TODO 7: Commit, push, and create a pull request. No auto-merge. (step 7)
+        // 1. Check issue status before spending any tokens.
+        if (skipReservation)
+        {
+            Log.Info("--skip-reservation: hopper over issue-statussjekken.");
+        }
+        else
+        {
+            Log.Info("Starter issue-statussjekk.");
+            var reason = await Reservation.IsBusy(task, AgentName);
+            if (reason is not null)
+            {
+                Log.Info($"Lar issuen ligge: {reason}.");
+                await Comment(task, $"**{AgentName}** lar denne ligge: {reason}.");
+                return 0;
+            }
+            // A visible assignment, not an exclusive lock.
+            await Reservation.Claim(task);
+            Log.Info("Issue-statussjekk ferdig. Fortsetter.");
+        }
 
-        await Task.CompletedTask;
-        return 2;
+        // 2. Clean workspace on a fresh branch. The model never works on main.
+        Log.Info($"Kloner {task.Repo} til {workspace} ...");
+        var repo = await Repository.Clone(task.Repo, workspace);
+        Log.Info($"Repo klart: {repo.Path}");
+        await repo.CreateBranch(task.BranchName);
+        Log.Info($"Branch {task.BranchName} i {repo.Path}");
+
+        // The result board reads this marker and displays who is working on what.
+        await Comment(repo, task, $"**{AgentName}** starter på denne nå.\n\n{StartMarker(task)}");
+
+        // 3. Build the context.
+        Log.Info("Installerer skills.");
+        InstallSkills();
+        var memory = await ReadMemory();
+        var systemPrompt = BuildSystemPrompt(memory);
+        Log.Info($"Systemprompt klar ({systemPrompt.Length} tegn).");
+        var previousOutput = "";
+
+        // 4. Run the configured model stages. The config decides the order, not the model.
+        foreach (var stage in config.Stages)
+        {
+            var model = string.IsNullOrWhiteSpace(stage.Model) ? config.Model : stage.Model;
+            Log.Step($"Stage «{stage.Name}» ({model}, {(stage.CanWrite ? "skriv" : "les")}-profil, maks {stage.MaxTurns} turer)");
+
+            var prompt = BuildPrompt(stage, task, previousOutput);
+            var result = await ClaudeRunner.Run(stage, model, prompt, systemPrompt, repo.Path);
+            runs.Add(new StageRun(stage.Name, model, result));
+            LogUsage(stage.Name, model, result);
+
+            if (!result.Ok)
+            {
+                Log.Error($"Stage «{stage.Name}» feilet: {result.Text[..Math.Min(result.Text.Length, 500)]}");
+                await Comment(repo, task,
+                    $"Agenten stoppet i stage «{stage.Name}».\n\n{Fence(result.Text, 1500)}\n\n{UsageTable(runs)}\n{EndMarker(task, "stoppet", pr: false, runs)}");
+                return 1;
+            }
+
+            // 4b. Implement never starts on a plan that was not approved.
+            if (stage.Name.Equals("plan-review", StringComparison.OrdinalIgnoreCase) &&
+                !result.Text.TrimStart().StartsWith("PLAN GODKJENT", StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Error("Plan review godkjente ikke planen. Ingen implementering eller PR.");
+                await Comment(repo, task,
+                    $"Agenten stoppet etter plan review.\n\n{Fence(result.Text, 1500)}\n\n{UsageTable(runs)}\n{EndMarker(task, "plan ikke godkjent", pr: false, runs)}");
+                await Remember(task, "stoppet, plan ikke godkjent", runs);
+                return 1;
+            }
+
+            previousOutput = result.Text;
+        }
+
+        // 5. A good explanation without a diff is not a delivery.
+        if (!await repo.HasChanges())
+        {
+            Log.Info("Ingen endringer i repoet. Poster agentens svar som kommentar.");
+            await Comment(repo, task,
+                $"Agenten gjorde ingen kodeendringer.\n\n{previousOutput}\n\n{UsageTable(runs)}\n{EndMarker(task, "ingen endring", pr: false, runs)}");
+            await Remember(task, "ingen kodeendring", runs);
+            return 0;
+        }
+
+        // 6. Build and test in code. The model saying it works is not a gate.
+        Log.Step("Build & deliver (deterministisk kode)");
+        var (verified, verifyLog) = await Verify(repo.Path);
+
+        if (!verified && config.StopOnVerifyFailure)
+        {
+            Log.Error("Verifisering feilet og stopOnVerifyFailure er satt. Ingen PR.");
+            await Comment(repo, task,
+                $"Agenten laget en endring, men bygg eller test feilet, så det ble ingen PR.\n\n{Fence(verifyLog, 2000)}\n\n{UsageTable(runs)}\n{EndMarker(task, "rødt bygg", pr: false, runs)}");
+            await Remember(task, "stoppet, rødt bygg", runs);
+            return 2;
+        }
+
+        // 7. Deliver as a pull request. No auto-merge: a person reviews and merges.
+        Log.Step("Leverer");
+        await repo.CommitAndPush(task.BranchName, $"{task.Title}\n\nLøser #{task.IssueNumber}.");
+        var prUrl = await repo.CreatePullRequest(
+            task.BranchName,
+            task.Title,
+            PrBody(task, previousOutput, verified, verifyLog, runs),
+            draft: !verified);
+        Log.Info($"PR: {prUrl}");
+
+        await Comment(repo, task,
+            $"{(verified ? "Pull request er klar" : "Pull request er opprettet som utkast, bygg eller test feilet")}: {prUrl}\n\n{UsageTable(runs)}\n{EndMarker(task, verified ? "pr" : "pr som utkast", pr: true, runs)}");
+
+        WriteSummary(task, prUrl, verified, runs);
+        await Remember(task, verified ? "PR levert" : "PR som utkast, rødt bygg", runs);
+        return 0;
     }
     // ASSEMBLY_END
 
